@@ -1,0 +1,34 @@
+services:
+
+  monolith:
+    image: tcc-llm-monolith:1.0
+    build:
+      context: ./monolith/tcc-llm-monolith
+    ports:
+      - "8080:8080"
+    networks:
+      - tcc-network
+
+  llm-service:
+    image: tcc-llm-service:1.0
+    build:
+      context: ./microservices/llm-service
+    networks:
+      - tcc-network
+
+  chat-service:
+    image: tcc-chat-service:1.0
+    build:
+      context: ./microservices/chat-service
+    ports:
+      - "8081:8081"
+    environment:
+      LLM_SERVICE_URL: http://llm-service:8082
+    depends_on:
+      - llm-service
+    networks:
+      - tcc-network
+
+networks:
+  tcc-network:
+    driver: bridge
