@@ -1,3 +1,4 @@
+
 services:
 
   monolith:
@@ -6,6 +7,8 @@ services:
       context: ./monolith/tcc-llm-monolith
     ports:
       - "8080:8080"
+    cpus: 4.0
+    mem_limit: 2g
     networks:
       - tcc-network
 
@@ -13,6 +16,8 @@ services:
     image: tcc-llm-service:1.0
     build:
       context: ./microservices/llm-service
+    cpus: 2.0
+    mem_limit: 1g
     networks:
       - tcc-network
 
@@ -24,6 +29,8 @@ services:
       - "8081:8081"
     environment:
       LLM_SERVICE_URL: http://llm-service:8082
+    cpus: 2.0
+    mem_limit: 1g
     depends_on:
       - llm-service
     networks:
