@@ -1,4 +1,4 @@
-"""Runner complementar: smoke e pilotos de carga aberta. Nao altera os dados oficiais."""
+"""Runner complementar: smoke, pilotos e testes controlados de carga aberta."""
 import argparse
 import csv
 import hashlib
@@ -22,26 +22,60 @@ SERVICES = {'monolith': ('monolith',), 'microservices': ('chat-service', 'llm-se
 IMAGES = {'monolith': 'tcc-llm-monolith:1.0', 'chat-service': 'tcc-chat-service:1.0',
           'llm-service': 'tcc-llm-service:1.0'}
 NOMINAL = (10, 50, 100, 150, 200, 250, 300)
+# Matriz controlada: cinco niveis de concorrencia nominal para cada delay.
+# Os tres primeiros foram investigados nos pilotos; 150 e 200 ampliam a carga.
+# A taxa e igual entre arquiteturas no mesmo cenario, nao entre delays.
+CONTROLLED_RATES = {
+    100: (100, 500, 1000, 1500, 2000),
+    500: (20, 100, 200, 300, 400),
+    2000: (5, 25, 50, 75, 100),
+}
+CONTROLLED_MODES = ('controlled-check', 'controlled')
 PROMPT = 'Teste de desempenho'
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--mode', choices=('plan-only', 'smoke', 'pilot'), default='plan-only')
+    p.add_argument('--mode', choices=('plan-only', 'smoke', 'pilot', *CONTROLLED_MODES), default='plan-only')
     p.add_argument('--architecture', choices=tuple(SERVICES), default='monolith')
     p.add_argument('--delay-ms', type=int, choices=(100, 500, 2000), default=100)
     p.add_argument('--pilot-levels', type=int, choices=range(1, 8), default=3)
     p.add_argument('--pre-allocated-vus', type=int, default=None)
+    p.add_argument('--rate', type=int, help='Taxa constante (req/s) para testes controlados')
+    p.add_argument('--repetition', type=int, choices=range(1, 6),
+                   help='Numero da repeticao oficial controlada (1 a 5)')
     p.add_argument('--confirm-open-load', action='store_true')
     args = p.parse_args()
     if args.pre_allocated_vus is not None and not 1 <= args.pre_allocated_vus <= 2000:
         p.error('--pre-allocated-vus deve estar entre 1 e 2000')
+    controlled = args.mode in CONTROLLED_MODES or (args.mode == 'plan-only' and args.rate is not None)
+    if controlled:
+        if args.rate not in CONTROLLED_RATES[args.delay_ms]:
+            p.error(f'Taxas permitidas para {args.delay_ms} ms: {CONTROLLED_RATES[args.delay_ms]}')
+        if args.pre_allocated_vus not in (None, 400):
+            p.error('A matriz controlada utiliza exatamente 400 VUs')
+        if args.mode == 'controlled' and args.repetition is None:
+            p.error('O modo controlled exige --repetition (1 a 5)')
+        if args.mode == 'controlled-check' and args.repetition is not None:
+            p.error('O teste de verificacao nao possui repeticao oficial')
+    elif args.rate is not None or args.repetition is not None:
+        p.error('--rate e --repetition sao exclusivos dos testes controlados')
     if args.mode != 'plan-only' and not args.confirm_open_load:
         p.error('Execucao exige --confirm-open-load')
     return args
 
 
 def build_plan(args):
+    # Um teste controlado mede apenas uma taxa, sem rampas.
+    # O aquecimento utiliza a mesma taxa; os dois processos k6 sao separados.
+    if args.mode in CONTROLLED_MODES or (args.mode == 'plan-only' and args.rate is not None):
+        return dict(mode='controlled' if args.mode == 'controlled' or
+                                         (args.mode == 'plan-only' and args.repetition is not None) else 'controlled-check',
+                    architecture=args.architecture, delay_ms=args.delay_ms,
+                    rates=[args.rate], pilot_levels=1, pre_allocated_vus=400, max_vus=400,
+                    hold_seconds=60, ramp_seconds=10, warmup_seconds=60,
+                    measurement_seconds=60, planned_measurement_iterations=args.rate*60,
+                    cooldown_seconds=10, repetition=args.repetition)
     smoke = args.mode == 'smoke'
     delay = args.delay_ms
     rates = [n * 1000 // delay for n in NOMINAL[:args.pilot_levels]]
@@ -203,7 +237,7 @@ def execute_phase(plan, phase, run_id, run_dir, ids):
         command.extend(['--env', f'{key}={val}'])
     command.append(str(SCRIPT))
     write_json(directory/'invocation.json', dict(command=command, environment=env,
-               phase=phase, started_utc=datetime.now(timezone.utc).isoformat()))
+                                                 phase=phase, started_utc=datetime.now(timezone.utc).isoformat()))
     print(f'{phase}: {duration}s; {planned} iteracoes nominais', flush=True)
     with (directory/'k6.log').open('x', encoding='utf-8') as log:
         proc = subprocess.Popen(command, cwd=ROOT, env=process_env, stdout=log, stderr=subprocess.STDOUT)
@@ -227,6 +261,12 @@ def execute(plan):
             raise RuntimeError('Existem containers neste projeto. Nao vou encerra-los automaticamente.')
         services = SERVICES[plan['architecture']]
         run_id = f"{plan['mode']}_{plan['architecture']}_{plan['delay_ms']}ms_" + datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        # Inclui taxa e repeticao no nome dos testes controlados. Os pilotos mantem o nome anterior.
+        if plan['mode'] in CONTROLLED_MODES:
+            label = f"{plan['mode']}_{plan['architecture']}_{plan['delay_ms']}ms_{plan['rates'][0]}rps"
+            if plan['repetition'] is not None:
+                label += f"_rep{plan['repetition']}"
+            run_id = label + '_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         run_dir = RESULTS/'open-load'/plan['mode']/run_id
         run_dir.mkdir(parents=True, exist_ok=False)
         print(f'Resultados: {run_dir}', flush=True)
@@ -254,10 +294,15 @@ def execute(plan):
             # Docker compose ps -q normalmente fornece IDs completos; normalizar explicitamente.
             ids = [capture(['docker','inspect','--format','{{.Id}}', i]) for i in ids]
             warmup = execute_phase(plan, 'warmup', run_id, run_dir, ids)
-            # Aquecimento inicial de baixa carga: problemas impedem um piloto interpretavel.
-            if (warmup['open_iterations_started'] != warmup['open_iterations_completed'] or
-                    warmup['open_requests_valid'] != warmup['open_iterations_completed'] or
-                    warmup['dropped_iterations'] or warmup['warnings']):
+            # Nos pilotos, o aquecimento de baixa carga continua exigindo sucesso.
+            # Nos controlados, descartes e falhas sob a taxa alvo sao resultados,
+            # inclusive no aquecimento. Nao encerrar a coleta apenas por saturacao.
+            if plan['mode'] in CONTROLLED_MODES:
+                if warmup['resource_errors'] or not warmup['k6_samples']:
+                    raise RuntimeError('Monitoramento do aquecimento incompleto; dados preservados.')
+            elif (warmup['open_iterations_started'] != warmup['open_iterations_completed'] or
+                  warmup['open_requests_valid'] != warmup['open_iterations_completed'] or
+                  warmup['dropped_iterations'] or warmup['warnings']):
                 raise RuntimeError('Aquecimento diagnostico nao passou; dados preservados.')
             measurement = execute_phase(plan, 'measurement', run_id, run_dir, ids)
             status = 'completed_with_warnings' if measurement['warnings'] else 'completed'
@@ -282,6 +327,7 @@ def execute(plan):
                 if problem is None:
                     raise RuntimeError(cleanup_error)
         print(f'Finalizado: {status}', flush=True)
+        return run_dir
 
 
 def main():
